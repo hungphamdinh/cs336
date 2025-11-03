@@ -6,3 +6,5 @@ chroma
 env/
 __pycache__
 data/
+tinystories/
+runs/
