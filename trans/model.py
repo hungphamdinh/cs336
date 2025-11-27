@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import math
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 # ------------------------------
 # Small from-scratch building blocks
@@ -23,14 +24,18 @@ def trunc_normal_(tensor: torch.Tensor, mean: float = 0.0, std: float = 1.0, a: 
         return tensor
 
 def gelu(x: torch.Tensor) -> torch.Tensor:
-    # Approximate GELU
-    return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * (x ** 3))))
+    """
+    Approximate GELU using PyTorch's optimized implementation.
+    This uses the tanh-based approximation, which is standard for Transformers
+    and maps efficiently to Apple's AMX/bfloat16 on M1/M2.
+    """
+    return F.gelu(x, approximate="tanh")
 
 def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    m = x.max(dim=dim, keepdim=True).values
-    y = torch.exp(x - m)
-    z = y.sum(dim=dim, keepdim=True)
-    return y / z
+    """
+    Wrapper around torch.softmax, which uses optimized kernels on each backend.
+    """
+    return torch.softmax(x, dim=dim)
 
 class Linear(nn.Module):
     """A no-bias Linear layer implemented with a single weight Parameter."""
@@ -59,18 +64,18 @@ class Embedding(nn.Module):
         return self.weight[token_ids]
 
 class LayerNorm(nn.Module):
-    """From-scratch LayerNorm with learnable gain/bias."""
+    """
+    LayerNorm wrapper that delegates to nn.LayerNorm.
+
+    This leverages PyTorch's fused, backend-optimized implementation, which is
+    better tuned for MPS/Apple Silicon than a from-scratch version using pow/sqrt.
+    """
     def __init__(self, d_model: int, eps: float = 1e-5, *, device=None, dtype=None):
         super().__init__()
-        self.eps = float(eps)
-        self.gain = nn.Parameter(torch.ones(d_model, device=device, dtype=dtype))
-        self.bias = nn.Parameter(torch.zeros(d_model, device=device, dtype=dtype))
+        self.ln = nn.LayerNorm(d_model, eps=eps, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mean = x.mean(dim=-1, keepdim=True)
-        var = (x - mean).pow(2).mean(dim=-1, keepdim=True)
-        xhat = (x - mean) / torch.sqrt(var + self.eps)
-        return xhat * self.gain + self.bias
+        return self.ln(x)
 
 class Dropout(nn.Module):
     """From-scratch inverted dropout (train only)."""
