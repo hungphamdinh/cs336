@@ -5,9 +5,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-# ------------------------------
-# Small from-scratch building blocks
-# ------------------------------
+from trans.attention.flashAttention import can_use_flash_attention, flash_attention_forward
+from trans.attention.localAttention import local_attention_forward
 
 def trunc_normal_(tensor: torch.Tensor, mean: float = 0.0, std: float = 1.0, a: float = -2.0, b: float = 2.0):
     # Simple truncated normal init using rejection sampling (sufficient for small params)
@@ -36,6 +35,7 @@ def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     Wrapper around torch.softmax, which uses optimized kernels on each backend.
     """
     return torch.softmax(x, dim=dim)
+
 
 class Linear(nn.Module):
     """A no-bias Linear layer implemented with a single weight Parameter."""
@@ -127,16 +127,27 @@ class CausalSelfAttention(nn.Module):
         B, L, C = x.shape
         H, D = self.n_head, self.head_dim
 
+        # Project to Q, K, V and shape as [B, H, L, D]
         Q = self.q_proj(x).view(B, L, H, D).transpose(1, 2)  # [B,H,L,D]
         K = self.k_proj(x).view(B, L, H, D).transpose(1, 2)  # [B,H,L,D]
         V = self.v_proj(x).view(B, L, H, D).transpose(1, 2)  # [B,H,L,D]
 
-        scores = (Q @ K.transpose(-2, -1)) / math.sqrt(D)     # [B,H,L,L]
-        scores = scores.masked_fill(~self.mask[:, :, :L, :L], float("-inf"))
-        P = softmax(scores, dim=-1)
-        P = self.drop(P)
-        Y = P @ V                                             # [B,H,L,D]
-        Y = Y.transpose(1, 2).contiguous().view(B, L, C)      # merge heads
+        # First try FlashAttention-2 (on supported NVIDIA GPUs), otherwise use the local SDPA/manual path.
+        Y = flash_attention_forward(
+            Q,
+            K,
+            V,
+            dropout_p=self.drop.p,
+            training=self.training,
+        )
+
+        if Y is None:
+            # Fallback for Mac M1/M2, older GPUs, or when flash-attn isn't installed.
+            causal_mask = self.mask[:, :, :L, :L]
+            Y = local_attention_forward(Q, K, V, causal_mask, self.drop)
+
+        # Merge heads back to [B, L, C]
+        Y = Y.transpose(1, 2).contiguous().view(B, L, C)
         return self.o_proj(Y)
 
 # ------------------------------

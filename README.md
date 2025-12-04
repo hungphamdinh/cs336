@@ -42,7 +42,8 @@ python -m trans.main \
   --train_txt tinystories/tinystories_train.txt \
   --benchmark \
   --warmup_steps 5 \
-  --measure_steps 10
+  --measure_steps 10 \
+  --compile_model
 
 python -m trans.main \
   --train_txt tinystories/tinystories_train.txt \
@@ -60,3 +61,40 @@ python -m trans.main \
   --profile_precision \
   --profile_steps 20 \
   --precision_mode bf16
+
+zip -r transformer_clean.zip . \
+    -x "*/__pycache__/*" \
+    -x "*.DS_Store" \
+    -x "*.pt" \
+    -x "env/*" \
+    -x ".git/*" \
+    -x "*.ipynb_checkpoints/*"
+
+torchrun --nproc_per_node=2 -m trans.main \
+  --train_txt tinystories/tinystories_train.txt \
+  --device cpu \
+  --no_in_memory_batches \
+  --num_workers 4 \
+  --batch_size 32 \
+  --seq_len 256
+
+
+python -m trans.main \
+  --train_txt tinystories/tinystories_train1.txt \
+  --device mps \
+  --benchmark \
+  --no_in_memory_batches \
+  --num_workers 4 \
+  --batch_size 32 \
+  --seq_len 256 \
+  --warmup_steps 10 \
+  --measure_steps 50
+
+python -m trans.main \
+  --train_txt tinystories/tinystories_train1.txt \
+  --device mps \
+  --benchmark \
+  --batch_size 32 \
+  --seq_len 256 \
+  --warmup_steps 10 \
+  --measure_steps 50 

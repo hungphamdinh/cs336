@@ -1,6 +1,9 @@
 from __future__ import annotations
 from trans.generate import generate_from_checkpoint
 import argparse, os, torch, json
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 from trans.bpe_tokenizer import BPETokenizer
 from trans.model import ModelConfig, GPT
 from trans.utils import set_seed, sample
@@ -12,6 +15,23 @@ def load_text(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
+
+# Helper for distributed info
+def get_dist_info():
+    """
+    Inspect environment variables (as set by torchrun) and return (rank, world_size, is_ddp).
+    If not running under distributed launch, returns (0, 1, False).
+    """
+    if not dist.is_available():
+        return 0, 1, False
+    rank_env = os.environ.get("RANK")
+    world_env = os.environ.get("WORLD_SIZE")
+    if rank_env is None or world_env is None:
+        return 0, 1, False
+    rank = int(rank_env)
+    world_size = int(world_env)
+    return rank, world_size, world_size > 1
+
 def main():
     if torch.cuda.is_available():
         default_device = "cuda"
@@ -19,6 +39,25 @@ def main():
         default_device = "mps"
     else:
         default_device = "cpu"
+
+    # If CUDA is available, prefer Flash / memory-efficient scaled dot-product attention
+    # (used by F.scaled_dot_product_attention) when possible.
+    if default_device == "cuda" and hasattr(torch.backends, "cuda"):
+        try:
+            # Try to enable Flash / mem-efficient SDPA, but keep math kernel enabled
+            # so that older GPUs (e.g., T4 on Kaggle, sm75) still have a valid fallback.
+            if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+                torch.backends.cuda.enable_flash_sdp(True)
+            if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
+            if hasattr(torch.backends.cuda, "enable_math_sdp"):
+                # IMPORTANT: keep math kernel ON, otherwise some (arch, dtype)
+                # combinations will have *no* available kernel and raise:
+                # "RuntimeError: No available kernel. Aborting execution."
+                torch.backends.cuda.enable_math_sdp(True)
+            print("[config] configured SDPA backends on CUDA (flash/mem-efficient + math fallback)")
+        except Exception as e:
+            print(f"[config] could not configure SDPA backends: {e}")
 
     ap = argparse.ArgumentParser(description="Transformer training with byte-level BPE")
     ap.add_argument("--train_txt", type=str, help="Path to training text (raw UTF-8)")
@@ -46,10 +85,7 @@ def main():
     ap.add_argument("--ckpt", type=str, default="ckpt.pt", help="Path to checkpoint for --generate")
     ap.add_argument("--gen_prompt", type=str, default="Once upon a time", help="Prompt text for --generate")
     ap.add_argument("--max_new_tokens", type=int, default=200, help="Max new tokens to generate for --generate")
-    ap.add_argument("--estimate-training", "--estimate_training", dest="estimate_training", action="store_true", help="Print training memory + time estimate and exit")
     ap.add_argument("--benchmark", action="store_true", help="Run training benchmark (warmup+timed steps) and exit")
-    ap.add_argument("--benchmark_compare", action="store_true",
-                    help="Benchmark FP32 vs Mixed Precision (bf16) and print results")
     ap.add_argument("--warmup_steps", type=int, default=5, help="Warmup steps for --estimate-training probe")
     ap.add_argument("--measure_steps", type=int, default=10, help="Measurement steps for --estimate-training probe")
     ap.add_argument(
@@ -80,9 +116,67 @@ def main():
         action="store_true",
         help="Use torch.compile() to optimize model execution (PyTorch 2.x)",
     )
+    ap.add_argument(
+        "--precision",
+        type=str,
+        choices=["auto", "fp32", "bf16"],
+        default="auto",
+        help="Training precision: auto (default), fp32, or bf16",
+    )
+    ap.add_argument(
+        "--benchmark_compile_compare",
+        action="store_true",
+        help="Benchmark with and without torch.compile() and compare",
+    )
+    ap.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="Number of DataLoader workers for CPU batch building when using DataLoader-based batches.",
+    )
+    ap.add_argument(
+        "--in_memory_batches",
+        dest="in_memory_batches",
+        action="store_true",
+        help="Use on-device in-memory random sampling batches where supported (default on GPU/MPS).",
+    )
+    ap.add_argument(
+        "--no_in_memory_batches",
+        dest="in_memory_batches",
+        action="store_false",
+        help="Disable in-memory batches; always use DataLoader + CPU workers (applies to both CPU and GPU/MPS).",
+    )
+    ap.set_defaults(in_memory_batches=True)
     args = ap.parse_args()
 
     set_seed(args.seed)
+
+    rank, world_size, is_ddp = get_dist_info()
+    # Allow DDP **only** for CPU/MPS. Disable GPU DDP completely.
+    if is_ddp and (args.device == "cpu" or args.device == "mps"):
+        backend = "gloo"
+        if not dist.is_initialized():
+            dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        set_seed(args.seed + rank)
+        if rank == 0:
+            print(f"[ddp] (CPU/MPS only) initialized process group backend=gloo rank={rank} world_size={world_size}")
+    else:
+        # Disable DDP entirely for CUDA
+        is_ddp = False
+        rank, world_size = 0, 1
+
+    # Decide training precision in a device-agnostic way:
+    # - auto: use bf16 on CUDA (AMP), fp32 elsewhere
+    # - fp32: always fp32
+    # - bf16: try to use bf16 where supported
+    if args.precision == "fp32":
+        train_use_bfloat16 = False
+    elif args.precision == "bf16":
+        train_use_bfloat16 = True
+    else:  # "auto"
+        train_use_bfloat16 = (args.device == "cuda")
+
+    print(f"[config] device={args.device}, precision={'bf16' if train_use_bfloat16 else 'fp32'}")
 
     # For CUDA, allow faster matmul kernels (TF32, etc.). No effect on MPS.
     if args.device == "cuda":
@@ -92,26 +186,7 @@ def main():
         except Exception as e:
             print(f"[config] could not set matmul precision: {e}")
 
-    if args.estimate_training:
-        rep = run_probe(args)
-        print("\n=== Training Memory & Time Estimate ===")
-        print(f"Device: {rep['device']} ({rep['cuda_name']})")
-        print(f"Model params: {rep['params']:,}")
-        ps = rep['param_state_bytes_est']
-        peak = rep['peak_alloc_bytes_measured']
-        total = rep['gpu_total_bytes']
-        print(f"Param+grad+optimizer (est): {sizeof_fmt(ps)} (~16 B/param)")
-        if peak:
-            print(f"Peak CUDA alloc (measured): {sizeof_fmt(peak)}")
-            print(f"GPU total memory: {sizeof_fmt(total)}")
-            print(f"Fits during measured step? {'YES' if peak < total else 'NO'}")
-        else:
-            print("CUDA not available: peak alloc not measured.")
-        print(f"\nBatch={rep['batch']}, Seq={rep['seq_len']}, d={rep['d_model']}, layers={rep['layers']}, heads={rep['heads']}, vocab={rep['vocab_size']}")
-        print(f"Avg step time: {rep['avg_step_time_sec']*1000:.2f} ms/step  (measured)")
-        print(f"Est total time for {rep['steps']} steps: {pretty_time(rep['est_total_time_sec'])}")
-        print("Note: Estimates depend on kernels/AMP; use as a ballpark.")
-        return
+    # Removed estimate_training block
 
     if args.profile:
          if not args.train_txt:
@@ -158,7 +233,8 @@ def main():
              grad_clip=args.clip,
              sample_every=0,
              sample_prompt=args.sample_prompt,
-             use_bfloat16=(args.device in ("cuda", "mps")),
+             use_bfloat16=train_use_bfloat16,
+             in_memory_batches=args.in_memory_batches,
          )
 
          print(f"[profile] running torch.profiler for {args.profile_steps} steps on device={args.device}")
@@ -168,79 +244,12 @@ def main():
              text,
              args.device,
              tcfg,
-             num_workers=0,
+             num_workers=args.num_workers,
              profile_steps=args.profile_steps,
          )
          return
 
-    if args.benchmark_compare:
-        if not args.train_txt:
-            raise SystemExit("--train_txt is required for --benchmark_compare")
-
-        text = load_text(args.train_txt)
-        if not os.path.exists(args.tokenizer):
-            print("[BPE] training tokenizer for benchmark compare...")
-            tok = BPETokenizer.train([text], vocab_size=args.vocab_size, progress=True)
-            tok.to_json(args.tokenizer)
-        else:
-            tok = BPETokenizer.from_json(args.tokenizer)
-
-        cfg = ModelConfig(
-            vocab_size=tok.vocab_size,
-            d_model=args.d_model,
-            n_layer=args.layers,
-            n_head=args.heads,
-            ff_mult=args.ff_mult,
-            seq_len=args.seq_len,
-            dropout=args.dropout,
-        )
-
-        # ---- FP32 model ----
-        model_fp32 = GPT(cfg).to(args.device)
-        tcfg_fp32 = TrainConfig(
-            seq_len=args.seq_len,
-            batch_size=args.batch_size,
-            steps=args.steps,
-            lr=args.lr,
-            warmup=args.warmup,
-            weight_decay=args.wd,
-            grad_clip=args.clip,
-            sample_every=0,
-            sample_prompt=args.sample_prompt,
-            use_bfloat16=False,
-        )
-        print("[bench-compare] FP32...")
-        res_fp32 = benchmark_training(
-            model_fp32, tok, text, args.device,
-            tcfg_fp32, warmup_steps=args.warmup_steps,
-            bench_steps=args.measure_steps, num_workers=0, return_stats=True
-        )
-
-        # ---- Mixed Precision (bf16) model ----
-        model_mp = GPT(cfg).to(args.device)
-        tcfg_mp = TrainConfig(
-            seq_len=args.seq_len,
-            batch_size=args.batch_size,
-            steps=args.steps,
-            lr=args.lr,
-            warmup=args.warmup,
-            weight_decay=args.wd,
-            grad_clip=args.clip,
-            sample_every=0,
-            sample_prompt=args.sample_prompt,
-            use_bfloat16=True,
-        )
-        print("[bench-compare] Mixed Precision (bf16)...")
-        res_mp = benchmark_training(
-            model_mp, tok, text, args.device,
-            tcfg_mp, warmup_steps=args.warmup_steps,
-            bench_steps=args.measure_steps, num_workers=0, return_stats=True
-        )
-
-        print("\n=== FP32 vs Mixed Precision ===")
-        print(f"FP32:  mean_ms={res_fp32['mean_ms']:.2f}  tok/s={res_fp32['toks_per_s']:.1f}")
-        print(f"MP:    mean_ms={res_mp['mean_ms']:.2f}  tok/s={res_mp['toks_per_s']:.1f}")
-        return
+    # Removed benchmark_compare block (FP32 vs Mixed Precision benchmark)
     
     if args.profile_precision:
         if not args.train_txt:
@@ -286,7 +295,8 @@ def main():
             grad_clip=args.clip,
             sample_every=0,
             sample_prompt=args.sample_prompt,
-            use_bfloat16=(args.device in ("cuda", "mps")),
+            use_bfloat16=train_use_bfloat16,
+            in_memory_batches=args.in_memory_batches,
         )
 
         use_bfloat16 = args.precision_mode == "bf16"
@@ -300,10 +310,11 @@ def main():
             args.device,
             tcfg,
             profile_steps=args.profile_steps,
-            num_workers=0,
+            num_workers=args.num_workers,
             use_bfloat16=use_bfloat16,
         )
         return
+
 
     if args.benchmark:
         if not args.train_txt:
@@ -347,7 +358,8 @@ def main():
             grad_clip=args.clip,
             sample_every=0,
             sample_prompt=args.sample_prompt,
-            use_bfloat16=(args.device in ("cuda", "mps")),
+            use_bfloat16=train_use_bfloat16,
+            in_memory_batches=args.in_memory_batches,
         )
         print(f"[bench] running benchmark: warmup_steps={args.warmup_steps}, measure_steps={args.measure_steps}")
         benchmark_training(
@@ -358,7 +370,7 @@ def main():
             tcfg,
             warmup_steps=args.warmup_steps,
             bench_steps=args.measure_steps,
-            num_workers=0,
+            num_workers=args.num_workers,
             return_stats=False,
         )
         return
@@ -385,12 +397,34 @@ def main():
     else:
         tok = BPETokenizer.from_json(args.tokenizer)
 
-    # Prepare model
-    cfg = ModelConfig(vocab_size=tok.vocab_size, d_model=args.d_model, n_layer=args.layers, n_head=args.heads, ff_mult=args.ff_mult, seq_len=args.seq_len, dropout=args.dropout)
-    model = GPT(cfg).to(args.device)
+    # Prepare model (single-process or wrapped in DDP depending on environment)
+    cfg = ModelConfig(
+        vocab_size=tok.vocab_size,
+        d_model=args.d_model,
+        n_layer=args.layers,
+        n_head=args.heads,
+        ff_mult=args.ff_mult,
+        seq_len=args.seq_len,
+        dropout=args.dropout,
+    )
+    model = GPT(cfg)
+
+    # Decide which device this rank should actually train on.
+    train_device = args.device
+    if is_ddp:
+        # Only CPU/MPS DDP allowed
+        train_device = args.device
+        model = model.to(train_device)
+        model = DDP(model)  # no device_ids needed for CPU/MPS
+        if rank == 0:
+            print(f"[ddp] using CPU/MPS DDP on device={train_device}")
+    else:
+        # GPU always runs single-process
+        model = model.to(train_device)
 
     if args.compile_model and hasattr(torch, "compile"):
         try:
+            # torch.compile should wrap the *local* model (DDP-wrapped or plain).
             model = torch.compile(model)
             print("[compile] model compiled with torch.compile()")
         except Exception as e:
@@ -409,6 +443,8 @@ def main():
         text = ("From fairest creatures we desire increase,\n" * 200)
     else:
         text = load_text(args.train_txt)
+        
+    
 
     # Train
     tcfg = TrainConfig(
@@ -421,12 +457,27 @@ def main():
         grad_clip=args.clip,
         sample_every=args.sample_every,
         sample_prompt=args.sample_prompt,
-        use_bfloat16=(args.device in ("cuda", "mps")),
+        use_bfloat16=train_use_bfloat16,
+        in_memory_batches=args.in_memory_batches,
     )
-    run_training(model, tok, text, args.device, tcfg, num_workers=0, resume=resume_obj, save_path=args.save)
 
-    # Final sample
-    print("\n[final sample]\n" + sample(model, tok, args.sample_prompt, 200))
+    # Only rank 0 should write checkpoints to disk; other ranks pass save_path=None
+    save_path = args.save if (rank == 0) else None
+
+    run_training(
+        model,
+        tok,
+        text,
+        train_device,
+        tcfg,
+        num_workers=args.num_workers,
+        resume=resume_obj,
+        save_path=save_path,
+    )
+
+    # Final sample: only print from rank 0 to avoid duplicate output.
+    if rank == 0:
+        print("\n[final sample]\n" + sample(model, tok, args.sample_prompt, 200))
     
 
 

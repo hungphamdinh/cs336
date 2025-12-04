@@ -46,9 +46,27 @@ def compute_loss(model: GPT, xb: torch.Tensor, yb: torch.Tensor, device: str, cf
     Assumes xb and yb are already on the correct device.
     """
     if device.startswith("cuda"):
-        # Use AMP only on CUDA; bf16 vs fp16 controlled by cfg.use_bfloat16
-        amp_dtype = torch.bfloat16 if cfg.use_bfloat16 else torch.float16
-        with torch.amp.autocast(device_type="cuda", enabled=True, dtype=amp_dtype):
+        # Decide which AMP dtype to use on CUDA.
+        # - If cfg.use_bfloat16 is False: run in pure fp32 (no autocast).
+        # - If cfg.use_bfloat16 is True and the GPU supports bf16: use bf16 autocast.
+        # - If cfg.use_bfloat16 is True but bf16 is not supported (e.g., T4): fall back to fp16 autocast.
+        supports_bf16 = hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+
+        if cfg.use_bfloat16 and supports_bf16:
+            amp_dtype = torch.bfloat16
+            use_autocast = True
+        elif cfg.use_bfloat16:
+            amp_dtype = torch.float16
+            use_autocast = True
+        else:
+            amp_dtype = None
+            use_autocast = False
+
+        if use_autocast:
+            with torch.amp.autocast(device_type="cuda", enabled=True, dtype=amp_dtype):
+                logits = model(xb)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), yb.view(-1))
+        else:
             logits = model(xb)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), yb.view(-1))
     elif device == "mps":
@@ -188,7 +206,15 @@ def run_training(model: GPT, tok: BPETokenizer, train_text: str, device: str, cf
             print(f"step={step}/{cfg.steps} loss={float(loss):.4f} lr={lr:.2e} t/50={dt:.2f}s")
         if cfg.sample_every and step % cfg.sample_every == 0:
             print("\n[sample]\n" + sample(model, tok, cfg.sample_prompt, 200)[:300] + "\n")
-        if step % 500 == 0 or step == cfg.steps:
+        if save_path is not None and (step % 500 == 0 or step == cfg.steps):
             os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-            torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "cfg": model.cfg.__dict__}, save_path)
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "opt": opt.state_dict(),
+                    "step": step,
+                    "cfg": model.cfg.__dict__,
+                },
+                save_path,
+            )
             print(f"[ckpt] saved -> {save_path}")
